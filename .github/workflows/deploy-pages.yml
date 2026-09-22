@@ -32,14 +32,10 @@ jobs:
       # never ships a recognizer that regressed against real captures.
       - run: npm test
       - run: npm run build
-      - uses: actions/configure-pages
-        with:
-          # Enable Pages (build type: Actions) on first run — no manual
-          # repo-settings step needed.
-          enablement: true
-      - uses: actions/upload-pages-artifact
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
         with:
           # The built Preact app is fully static; publish it as the site root.
           path: apps/web/dist
       - id: deployment
-        uses: actions/deploy-pages
+        uses: actions/deploy-pages@v4
