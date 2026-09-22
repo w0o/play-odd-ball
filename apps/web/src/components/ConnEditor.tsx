@@ -10,6 +10,8 @@ import {
   INSTRUMENTS,
   isGestureSource,
   gestureBySource,
+  instrumentTiming,
+  mainBpmSig,
   paramByKey,
   paramsList,
   paramValue,
@@ -19,7 +21,7 @@ import {
   disconnect,
   moveInSequence,
   seqConfig,
-  seqGapFor,
+  seqDivisionFor,
   setSeqMode,
   shape,
   siblingsOf,
@@ -28,6 +30,14 @@ import {
 import { saveStateSoon } from "../runtime/persist";
 import { persistGesturesSoon } from "../runtime/gestures";
 import { useFrame } from "../hooks";
+import {
+  DEFAULT_BPM,
+  DIVISIONS,
+  clampBpm,
+  effectiveBpm,
+  stepSeconds,
+  type BeatDivision,
+} from "../audio/transport";
 
 export function ConnEditor() {
   const editing = connEditorSig.value;
@@ -83,8 +93,10 @@ export function ConnEditor() {
   const gesture = isGestureSource(conn.source);
   const sequenced = sourceSequenced(conn.source);
   const idx = sibs.indexOf(editing.instKey);
-  const gap = seqGapFor(conn.source);
   const mode = gesture ? "sequence" : seqConfig(conn.source).mode;
+  const timing = instrumentTiming[editing.instKey];
+  const effectiveTempo = effectiveBpm(timing, mainBpmSig.value);
+  const division = seqDivisionFor(conn.source);
 
   return (
     <div class="conn-editor" ref={boxRef}>
@@ -131,6 +143,61 @@ export function ConnEditor() {
       <div class="ce-meter">
         <div class="ce-meter-in" ref={meterInRef}></div>
         <div class="ce-meter-out" ref={meterOutRef}></div>
+      </div>
+      <div class="ce-seq ce-rhythm">
+        <div class="ce-seq-head">rhythm · <span>{effectiveTempo} BPM</span></div>
+        <div class="ce-seq-mode">
+          <button
+            class={`ce-mode-btn${timing.mode === "main" ? " is-active" : ""}`}
+            onClick={() => {
+              timing.mode = "main";
+              bump((n) => n + 1);
+              saveStateSoon();
+            }}
+          >
+            follow main
+          </button>
+          <button
+            class={`ce-mode-btn${timing.mode === "custom" ? " is-active" : ""}`}
+            onClick={() => {
+              timing.mode = "custom";
+              timing.bpm = mainBpmSig.peek();
+              bump((n) => n + 1);
+              saveStateSoon();
+            }}
+          >
+            custom
+          </button>
+        </div>
+        {timing.mode === "custom" && (
+          <div class="ce-row ce-tempo-row">
+            <label>instrument BPM</label>
+            <input
+              type="number"
+              min="30"
+              max="300"
+              value={timing.bpm}
+              onChange={(e) => {
+                timing.bpm = clampBpm(+(e.target as HTMLInputElement).value);
+                bump((n) => n + 1);
+                saveStateSoon();
+              }}
+            />
+          </div>
+        )}
+        <div class="ce-row">
+          <label>pulse division</label>
+          <select
+            value={timing.division}
+            onChange={(e) => {
+              timing.division = (e.target as HTMLSelectElement).value as BeatDivision;
+              bump((n) => n + 1);
+              saveStateSoon();
+            }}
+          >
+            {DIVISIONS.map((value) => <option value={value} key={value}>{value}</option>)}
+          </select>
+        </div>
       </div>
       {inst?.noted && (
         <div class="ce-row ce-note">
@@ -196,28 +263,26 @@ export function ConnEditor() {
                 </button>
               </div>
               <div class="ce-row">
-                <label>
-                  spacing <span class="ce-num">{gap}</span> ms
-                </label>
-                <input
-                  type="range"
-                  min="0"
-                  max="600"
-                  step="10"
-                  value={gap}
-                  onInput={(e) => {
-                    const val = +(e.target as HTMLInputElement).value;
+                <label>spacing</label>
+                <select
+                  value={division}
+                  onChange={(e) => {
+                    const val = (e.target as HTMLSelectElement).value as BeatDivision;
                     const g = gestureBySource(conn.source);
                     if (g) {
-                      g.seqGap = val;
+                      g.seqGap = stepSeconds(DEFAULT_BPM, val) * 1000;
                       persistGesturesSoon();
                     } else {
-                      seqConfig(conn.source).gap = val;
+                      const config = seqConfig(conn.source);
+                      config.stepDivision = val;
+                      config.gap = stepSeconds(DEFAULT_BPM, val) * 1000;
                       saveStateSoon();
                     }
                     touchConnections();
                   }}
-                />
+                >
+                  {DIVISIONS.map((value) => <option value={value} key={value}>{value}</option>)}
+                </select>
               </div>
             </div>
           )}

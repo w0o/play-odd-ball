@@ -8,11 +8,14 @@ import {
   engine,
   gestureEnv,
   INSTRUMENTS,
+  instrumentTiming,
   live,
+  mainBpmSig,
   paramValue,
   rateSig,
   runFrameCbs,
   sensitivitySig,
+  transportBeatSig,
   seqCfg,
   seqEnv,
   seqOnset,
@@ -24,6 +27,7 @@ import {
   SPARK_MAX,
   paramsList,
 } from "./state";
+import { transport } from "../audio/transport";
 import { connNote, fireChain, shape, siblingsOf, updateChimes } from "./patch";
 import { sampleSession, tickRawRec } from "./recording";
 
@@ -40,7 +44,9 @@ function updateInstruments(now: number): void {
   for (const inst of INSTRUMENTS) {
     const conn = connections[inst.key];
     const v = shape(conn, inst.key);
-    if (inst.key !== "chimes") audio.setVoice(inst.key, v, connNote(conn));
+    if (inst.key !== "chimes") {
+      audio.setVoice(inst.key, v, connNote(conn), instrumentTiming[inst.key], mainBpmSig.peek());
+    }
     else updateChimes(conn, v, now);
   }
 }
@@ -106,6 +112,8 @@ export function startLoop(): void {
     sampleSession(now);
     tickRawRec(now);
     runFrameCbs({ now, dt: snap.dt });
+    const beat = Math.floor(transport.beatPosition(mainBpmSig.peek()));
+    if (transportBeatSig.peek() !== beat) transportBeatSig.value = beat;
 
     if (now - lastRate >= 1000) {
       rateSig.value = Math.round(((engine.msgCount - lastCount) * 1000) / (now - lastRate));

@@ -8,8 +8,10 @@ import {
   engine,
   gestureBySource,
   INSTRUMENTS,
+  instrumentTiming,
   isGestureSource,
   mkConn,
+  mainBpmSig,
   paramByKey,
   paramValue,
   seqCfg,
@@ -25,6 +27,7 @@ import {
 } from "./state";
 import { saveStateSoon } from "./persist";
 import { setSoundOn } from "./sound";
+import { DEFAULT_BPM, divisionFromMilliseconds, stepSeconds, type BeatDivision } from "../audio/transport";
 
 /** Drop queued chain steps, onset trackers and live trigger envelopes — called
  * when the patch is cleared or swapped so steps scheduled milliseconds earlier
@@ -43,7 +46,11 @@ export function siblingsOf(source: string): string[] {
 }
 
 export function seqConfig(source: string) {
-  return seqCfg[source] || (seqCfg[source] = { mode: "together", gap: SEQ_GAP_DEFAULT });
+  return seqCfg[source] || (seqCfg[source] = {
+    mode: "together",
+    gap: SEQ_GAP_DEFAULT,
+    stepDivision: divisionFromMilliseconds(SEQ_GAP_DEFAULT),
+  });
 }
 
 /**
@@ -67,11 +74,21 @@ export function seqGapFor(source: string): number {
   return seqConfig(source).gap;
 }
 
+export function seqDivisionFor(source: string): BeatDivision {
+  if (isGestureSource(source)) return divisionFromMilliseconds(seqGapFor(source), DEFAULT_BPM);
+  const config = seqConfig(source);
+  return config.stepDivision ?? divisionFromMilliseconds(config.gap, DEFAULT_BPM);
+}
+
 /** Fire a source's connected instruments in play order, staggered by `gap` ms. */
 export function fireChain(source: string, gap: number): void {
   const now = performance.now();
+  const division = isGestureSource(source)
+    ? divisionFromMilliseconds(gap, DEFAULT_BPM)
+    : seqDivisionFor(source);
+  const musicalGap = stepSeconds(mainBpmSig.peek(), division) * 1000;
   siblingsOf(source).forEach((instKey, i) => {
-    if (gap > 0 && i > 0) seqQueue.push({ instKey, at: now + i * gap });
+    if (musicalGap > 0 && i > 0) seqQueue.push({ instKey, at: now + i * musicalGap });
     else seqEnv[instKey] = 1;
   });
 }
@@ -204,7 +221,7 @@ export function updateChimes(conn: Conn | null, v: number, now: number): void {
   if (!chimeDirect(conn)) {
     if (chimeState.prev < SEQ_ONSET_LO && v >= SEQ_ONSET_HI && now - chimeState.last > SEQ_ONSET_COOLDOWN) {
       chimeState.last = now;
-      audio.hit(Math.round(clamp1(v) * 127), chimePitch(conn));
+      audio.hit(Math.round(clamp1(v) * 127), chimePitch(conn), instrumentTiming.chimes, mainBpmSig.peek());
     }
   }
   chimeState.prev = v;

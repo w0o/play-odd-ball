@@ -6,6 +6,8 @@
 //   layer routes any calculated parameter (roll speed, tilt, energy, ...) into
 //   any voice, so instruments can be freely patched to parameters.
 
+import { effectiveBpm, stepSeconds, transport, type InstrumentTiming } from "./transport";
+
 const PENTATONIC = [0, 3, 5, 7, 10]; // minor pentatonic semitone offsets
 const clamp01 = (x: number) => Math.max(0, Math.min(1, x));
 const mtof = (m: number) => 440 * Math.pow(2, (m - 69) / 12);
@@ -31,6 +33,10 @@ interface Voice {
   /** `note` (0..1), when provided, overrides the voice's own pitch choice —
    * only the `noted` instruments read it. */
   set: (v: number, note?: number) => void;
+  /** Event voices are fired ahead of time on their transport lane. */
+  trigger?: (v: number, note: number | undefined, at: number) => void;
+  /** Periodic continuous voices lock their audible modulation to lane speed. */
+  sync?: (hz: number) => void;
   // per-voice scratch state used by the event/arp voices
   last?: number;
   phase?: number;
@@ -38,6 +44,14 @@ interface Voice {
   active?: number;
   rpm?: number;
   prevV?: number;
+}
+
+interface ClockLane {
+  next: number;
+  signature: string;
+  revision: number;
+  pending: number;
+  note?: number;
 }
 
 export class AudioEngine {
@@ -51,6 +65,8 @@ export class AudioEngine {
   voices: Record<string, Voice> = {};
   chimesOn = true; // tap/note mallet hits
   private previewing: Record<string, number> | null = null;
+  private clockLanes: Record<string, ClockLane> = {};
+  private oneShotGrid: Record<string, number> = {};
 
   // Instruments the UI can expose. Chimes is added by the app layer (it's an
   // event instrument rather than a continuous voice).
@@ -92,6 +108,7 @@ export class AudioEngine {
     }
     const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
     this.ctx = ctx;
+    transport.attach(ctx);
 
     this.master = ctx.createGain();
     this.master.gain.value = 0.9;
@@ -149,11 +166,50 @@ export class AudioEngine {
 
   /** Route a 0..1 parameter value into a continuous voice. `note` (0..1),
    * when given, picks the pitch of the noted instruments' next event. */
-  setVoice(key: string, value: number, note?: number): void {
+  setVoice(key: string, value: number, note?: number, timing?: InstrumentTiming, mainBpm = 120): void {
     if (!this.enabled) return;
     if (this.previewing && this.previewing[key]) return; // a preview owns this voice
     const v = this.voices[key];
-    if (v) v.set(clamp01(value), note);
+    if (!v) return;
+    const level = clamp01(value);
+    if (!timing) return void v.set(level, note);
+    const bpm = effectiveBpm(timing, mainBpm);
+    const period = stepSeconds(bpm, timing.division);
+    v.sync?.(1 / period);
+    // Hybrid voices (for example thunder's rain bed and UFO's sustained tone)
+    // still need their continuous control path in addition to grid events.
+    v.set(level, note);
+    if (!v.trigger) return;
+
+    // Event voices remember short gesture/tap peaks until their next local grid
+    // point. Sustained inputs repopulate the pending value on every frame.
+    const signature = `${bpm}:${timing.division}:${timing.phaseOffset}`;
+    let lane = this.clockLanes[key];
+    const now = this.ctx!.currentTime;
+    const laneOrigin = transport.origin + (timing.phaseOffset * 60) / bpm;
+    if (!lane || lane.signature !== signature || lane.revision !== transport.revision) {
+      const steps = Math.max(0, Math.ceil((now - laneOrigin) / period - 1e-9));
+      lane = this.clockLanes[key] = {
+        next: laneOrigin + steps * period,
+        signature,
+        revision: transport.revision,
+        pending: 0,
+      };
+    }
+    if (level > lane.pending) {
+      lane.pending = level;
+      lane.note = note;
+    }
+    const horizon = now + 0.08;
+    while (lane.next <= horizon) {
+      if (lane.pending > 0.02) v.trigger(lane.pending, lane.note, Math.max(now, lane.next));
+      lane.pending = 0;
+      lane.next += period;
+    }
+  }
+
+  resetTransportLanes(): void {
+    this.clockLanes = {};
   }
 
   // Play a short, representative demo of a single instrument so the user can
@@ -174,6 +230,10 @@ export class AudioEngine {
     }
     const v = this.voices[key];
     if (!v) return;
+    if (v.trigger) {
+      v.trigger(0.9, undefined, this.ctx.currentTime);
+      return;
+    }
     if (!this.previewing) this.previewing = {};
     const id = (this.previewing[key] || 0) + 1;
     this.previewing[key] = id;
@@ -293,6 +353,7 @@ export class AudioEngine {
       amLfo.frequency.value = 4 + v * 14;
       vibLfo.frequency.value = 4 + v * 6;
     };
+    voice.sync = (hz) => { amLfo.frequency.value = hz; };
     return voice;
   }
 
@@ -382,6 +443,7 @@ export class AudioEngine {
       noiseGain.gain.value = 0.05 + v * 0.22;
       flutter.frequency.value = 6 + v * 4;
     };
+    voice.sync = (hz) => { amLfo.frequency.value = hz; };
     return voice;
   }
 
@@ -478,29 +540,19 @@ export class AudioEngine {
     out.gain.value = 1; // plucks manage their own envelopes; out is a bus
     const voice: Voice = { out, level: 0, last: 0, phase: 0, active: 0, set: () => {} };
     const scale = [0, 3, 5, 7, 10, 12]; // pentatonic-ish steps
-    voice.set = (v, note) => {
-      voice.active = v; // gate handled at trigger time
-      const now = performance.now();
-      if (v <= 0.02) {
-        voice.last = now;
-        return;
-      }
-      const interval = 260 - v * 190; // fast (70ms) when high, slow (260ms) when low
-      if (now - voice.last! >= interval) {
-        voice.last = now;
-        const deg =
-          typeof note === "number"
-            ? scaleDeg(scale, note)
-            : scale[voice.phase!++ % scale.length] + 12 * Math.floor(v * 2);
-        this._pluck(mtof(52 + deg), 0.12 + v * 0.25, out);
-      }
+    voice.trigger = (v, note, at) => {
+      const deg =
+        typeof note === "number"
+          ? scaleDeg(scale, note)
+          : scale[voice.phase!++ % scale.length] + 12 * Math.floor(v * 2);
+      this._pluck(mtof(52 + deg), 0.12 + v * 0.25, out, at);
     };
     return voice;
   }
 
-  private _pluck(hz: number, gain: number, dest: AudioNode): void {
+  private _pluck(hz: number, gain: number, dest: AudioNode, at?: number): void {
     const ctx = this.ctx!;
-    const t = ctx.currentTime;
+    const t = at ?? ctx.currentTime;
     const o = ctx.createOscillator();
     o.type = "triangle";
     o.frequency.value = hz;
@@ -522,8 +574,7 @@ export class AudioEngine {
     const scale = [0, 2, 4, 5, 7, 9, 11]; // major
     const span = 17; // steps up before turning back down
     const voice: Voice = { out, level: 0, last: 0, step: 0, set: () => {} };
-    voice.set = (v, note) => {
-      if (!this._due(voice, v, 170, 820)) return;
+    voice.trigger = (v, note, at) => {
       let idx: number;
       let root: number;
       if (typeof note === "number") {
@@ -538,14 +589,14 @@ export class AudioEngine {
         root = 48 + Math.round(v * 5); // value nudges the register
       }
       const deg = scale[idx % scale.length] + 12 * Math.floor(idx / scale.length);
-      this._pianoNote(mtof(root + deg), 0.1 + v * 0.28, out);
+      this._pianoNote(mtof(root + deg), 0.1 + v * 0.28, out, at);
     };
     return voice;
   }
 
-  private _pianoNote(hz: number, gain: number, dest: AudioNode): void {
+  private _pianoNote(hz: number, gain: number, dest: AudioNode, at?: number): void {
     const ctx = this.ctx!;
-    const t = ctx.currentTime;
+    const t = at ?? ctx.currentTime;
     const g = ctx.createGain();
     g.gain.value = 0;
     // Brightness fades over the note (mimics upper partials decaying first).
@@ -619,9 +670,9 @@ export class AudioEngine {
   }
 
   /** FM bell "ping": a bright metallic tone with an exponential decay. */
-  private _ping(hz: number, gain: number, dest: AudioNode, decay = 1.4, ratio = 2.01): void {
+  private _ping(hz: number, gain: number, dest: AudioNode, decay = 1.4, ratio = 2.01, at?: number): void {
     const ctx = this.ctx!;
-    const t = ctx.currentTime;
+    const t = at ?? ctx.currentTime;
     const car = ctx.createOscillator();
     car.type = "sine";
     car.frequency.value = hz;
@@ -642,35 +693,6 @@ export class AudioEngine {
     car.stop(t + decay + 0.1);
     mod.stop(t + decay + 0.1);
     setTimeout(() => g.disconnect(), (decay + 0.3) * 1000);
-  }
-
-  // Random-trigger scheduler shared by the sprinkly/percussive voices. Returns
-  // true (and advances voice.last) when it's time to fire an event.
-  //
-  // Two ways to fire:
-  //   • Rising edge — a fast jump in value (a fresh tap / gesture spike) fires
-  //     immediately, as long as we're past a short retrigger gap. This is what
-  //     lets transient sources like the Tap envelope actually trigger one-shot
-  //     voices (their spike is too brief to ever satisfy the sustained clock).
-  //   • Sustained — while the value stays up, keep firing at an interval that
-  //     shortens as the value grows.
-  private _due(voice: Voice, v: number, minMs: number, maxMs: number): boolean {
-    const now = performance.now();
-    const prev = voice.prevV ?? 0;
-    voice.prevV = v;
-    if (v <= 0.02) return false; // silent: don't fire, and don't reset the clock
-    const sinceLast = now - voice.last!;
-    if (v - prev > 0.1 && sinceLast >= minMs * 0.5) {
-      voice.last = now;
-      return true;
-    }
-    const base = maxMs - v * (maxMs - minMs);
-    const interval = base * (0.5 + Math.random());
-    if (sinceLast >= interval) {
-      voice.last = now;
-      return true;
-    }
-    return false;
   }
 
   // ---- Thunderstorm: rain bed + randomly cracking thunder ----------------
@@ -695,20 +717,16 @@ export class AudioEngine {
       voice.level += (target - voice.level) * 0.08;
       rain.gain.value = voice.level;
       lp.frequency.value = 1200 + v * 4500;
-      const now = performance.now();
-      if (v > 0.04 && now - voice.last! > 450) {
-        if (Math.random() < 0.0015 + v * 0.02) {
-          voice.last = now;
-          this._thunderBoom(out, 0.35 + v * 0.6);
-        }
-      }
+    };
+    voice.trigger = (v, _note, at) => {
+      if (v > 0.04 && Math.random() < 0.12 + v * 0.45) this._thunderBoom(out, 0.35 + v * 0.6, at);
     };
     return voice;
   }
 
-  private _thunderBoom(dest: AudioNode, level: number): void {
+  private _thunderBoom(dest: AudioNode, level: number, at?: number): void {
     const ctx = this.ctx!;
-    const t = ctx.currentTime;
+    const t = at ?? ctx.currentTime;
     const src = ctx.createBufferSource();
     src.buffer = this._noiseBuffer(2.6);
     const lp = ctx.createBiquadFilter();
@@ -734,15 +752,13 @@ export class AudioEngine {
     const out = this._out();
     out.gain.value = 1;
     const voice: Voice = { out, level: 0, last: 0, set: () => {} };
-    voice.set = (v) => {
-      if (this._due(voice, v, 340, 2600)) this._lightningStrike(out, v);
-    };
+    voice.trigger = (v, _note, at) => this._lightningStrike(out, v, at);
     return voice;
   }
 
-  private _lightningStrike(dest: AudioNode, v: number): void {
+  private _lightningStrike(dest: AudioNode, v: number, at?: number): void {
     const ctx = this.ctx!;
-    const t = ctx.currentTime;
+    const t = at ?? ctx.currentTime;
     const level = 0.4 + v * 0.7;
 
     // 1) Bright crackle: several rapid highpassed noise spikes (the flicker).
@@ -852,15 +868,13 @@ export class AudioEngine {
     const out = this._out();
     out.gain.value = 1;
     const voice: Voice = { out, level: 0, last: 0, set: () => {} };
-    voice.set = (v) => {
-      if (this._due(voice, v, 320, 2400)) this._thunderclap(out, v);
-    };
+    voice.trigger = (v, _note, at) => this._thunderclap(out, v, at);
     return voice;
   }
 
-  private _thunderclap(dest: AudioNode, v: number): void {
+  private _thunderclap(dest: AudioNode, v: number, at?: number): void {
     const ctx = this.ctx!;
-    const t = ctx.currentTime;
+    const t = at ?? ctx.currentTime;
     const level = 0.55 + v * 0.8;
 
     // 1) The rip/crack: bright distorted noise transient with a razor attack.
@@ -968,6 +982,7 @@ export class AudioEngine {
       sizBp.frequency.value = 1200 + v * 900;
       gustDepth.gain.value = voice.level * 0.33; // gust swing scales with level
     };
+    voice.sync = (hz) => { gust.frequency.value = hz; };
     return voice;
   }
 
@@ -1042,14 +1057,12 @@ export class AudioEngine {
     out.gain.value = 1;
     const scale = [0, 2, 4, 7, 9, 12, 16];
     const voice: Voice = { out, level: 0, last: 0, set: () => {} };
-    voice.set = (v, note) => {
-      if (this._due(voice, v, 90, 700)) {
-        const deg =
-          typeof note === "number"
-            ? scaleDeg(scale, note)
-            : scale[Math.floor(Math.random() * scale.length)] + 12 * Math.floor(Math.random() * 2);
-        this._ping(mtof(72 + deg), 0.06 + v * 0.12, out, 1.2 + v * 1.8, 1.41);
-      }
+    voice.trigger = (v, note, at) => {
+      const deg =
+        typeof note === "number"
+          ? scaleDeg(scale, note)
+          : scale[Math.floor(Math.random() * scale.length)] + 12 * Math.floor(Math.random() * 2);
+      this._ping(mtof(72 + deg), 0.06 + v * 0.12, out, 1.2 + v * 1.8, 1.41, at);
     };
     return voice;
   }
@@ -1060,29 +1073,20 @@ export class AudioEngine {
     out.gain.value = 1;
     const scale = [0, 3, 5, 6, 7, 10];
     const voice: Voice = { out, level: 0, last: 0, phase: 0, set: () => {} };
-    voice.set = (v, note) => {
-      const now = performance.now();
-      if (v <= 0.02) {
-        voice.last = now;
-        return;
-      }
-      const interval = 240 - v * 175;
-      if (now - voice.last! >= interval) {
-        voice.last = now;
-        const deg =
-          typeof note === "number"
-            ? scaleDeg(scale, note)
-            : scale[voice.phase! % scale.length] + 12 * (voice.phase! % 3 === 0 ? 1 : 0);
-        voice.phase!++;
-        this._acidNote(mtof(40 + deg), 0.18 + v * 0.22, out, v);
-      }
+    voice.trigger = (v, note, at) => {
+      const deg =
+        typeof note === "number"
+          ? scaleDeg(scale, note)
+          : scale[voice.phase! % scale.length] + 12 * (voice.phase! % 3 === 0 ? 1 : 0);
+      voice.phase!++;
+      this._acidNote(mtof(40 + deg), 0.18 + v * 0.22, out, v, at);
     };
     return voice;
   }
 
-  private _acidNote(hz: number, gain: number, dest: AudioNode, v: number): void {
+  private _acidNote(hz: number, gain: number, dest: AudioNode, v: number, at?: number): void {
     const ctx = this.ctx!;
-    const t = ctx.currentTime;
+    const t = at ?? ctx.currentTime;
     const o = ctx.createOscillator();
     o.type = "sawtooth";
     o.frequency.value = hz;
@@ -1142,6 +1146,7 @@ export class AudioEngine {
       lp.frequency.value = 250 + v * 500;
       lfoDepth.gain.value = 300 + v * 900;
     };
+    voice.sync = (hz) => { lfo.frequency.value = hz; };
     return voice;
   }
 
@@ -1174,6 +1179,7 @@ export class AudioEngine {
       growlLfo.frequency.value = 18 + v * 60;
       bp.frequency.value = 300 + v * 1400;
     };
+    voice.sync = (hz) => { growlLfo.frequency.value = hz; };
     return voice;
   }
 
@@ -1203,6 +1209,7 @@ export class AudioEngine {
       lfo.frequency.value = 0.2 + v * 4;
       o.frequency.value = 500 + v * 500;
     };
+    voice.sync = (hz) => { lfo.frequency.value = hz; };
     return voice;
   }
 
@@ -1211,15 +1218,13 @@ export class AudioEngine {
     const out = this._out();
     out.gain.value = 1;
     const voice: Voice = { out, level: 0, last: 0, set: () => {} };
-    voice.set = (v) => {
-      if (this._due(voice, v, 60, 500)) this._zap(out, v);
-    };
+    voice.trigger = (v, _note, at) => this._zap(out, v, at);
     return voice;
   }
 
-  private _zap(dest: AudioNode, v: number): void {
+  private _zap(dest: AudioNode, v: number, at?: number): void {
     const ctx = this.ctx!;
-    const t = ctx.currentTime;
+    const t = at ?? ctx.currentTime;
     const o = ctx.createOscillator();
     o.type = "square";
     const top = 1200 + Math.random() * 2600;
@@ -1241,15 +1246,13 @@ export class AudioEngine {
     const out = this._out();
     out.gain.value = 1;
     const voice: Voice = { out, level: 0, last: 0, set: () => {} };
-    voice.set = (v) => {
-      if (this._due(voice, v, 70, 500)) this._bloop(out, v);
-    };
+    voice.trigger = (v, _note, at) => this._bloop(out, v, at);
     return voice;
   }
 
-  private _bloop(dest: AudioNode, v: number): void {
+  private _bloop(dest: AudioNode, v: number, at?: number): void {
     const ctx = this.ctx!;
-    const t = ctx.currentTime;
+    const t = at ?? ctx.currentTime;
     const o = ctx.createOscillator();
     o.type = "sine";
     const base = 200 + Math.random() * 700;
@@ -1304,6 +1307,7 @@ export class AudioEngine {
       h.frequency.value = hz * 2;
       vib.frequency.value = 0.6 + v * 2;
     };
+    voice.sync = (hz) => { vib.frequency.value = hz; };
     return voice;
   }
 
@@ -1312,15 +1316,13 @@ export class AudioEngine {
     const out = this._out();
     out.gain.value = 1;
     const voice: Voice = { out, level: 0, last: 0, set: () => {} };
-    voice.set = (v) => {
-      if (this._due(voice, v, 120, 900)) this._chirp(out, v);
-    };
+    voice.trigger = (v, _note, at) => this._chirp(out, v, at);
     return voice;
   }
 
-  private _chirp(dest: AudioNode, v: number): void {
+  private _chirp(dest: AudioNode, v: number, at?: number): void {
     const ctx = this.ctx!;
-    const t = ctx.currentTime;
+    const t = at ?? ctx.currentTime;
     const o = ctx.createOscillator();
     o.type = "square";
     o.frequency.value = 4200 + Math.random() * 1500;
@@ -1383,13 +1385,9 @@ export class AudioEngine {
       this._glide(voice, v > 0.01 ? 0.02 + v * 0.16 : 0, 0.2, 0.1);
       fm.frequency.value = 3 + v * 18;
       fmDepth.gain.value = 80 + v * 500;
-      const now = performance.now();
-      if (now - voice.last! > 900 + Math.random() * 1200) {
-        // occasional pitch jumps
-        voice.last = now;
-        o.frequency.setTargetAtTime(300 + Math.random() * 900, this.ctx!.currentTime, 0.08);
-      }
     };
+    voice.sync = (hz) => { fm.frequency.value = hz; };
+    voice.trigger = (_v, _note, at) => o.frequency.setTargetAtTime(300 + Math.random() * 900, at, 0.08);
     return voice;
   }
 
@@ -1399,20 +1397,11 @@ export class AudioEngine {
     out.gain.value = 1;
     const scale = [0, 2, 5, 7, 9]; // slendro-ish
     const voice: Voice = { out, level: 0, last: 0, phase: 0, set: () => {} };
-    voice.set = (v, note) => {
-      const now = performance.now();
-      if (v <= 0.02) {
-        voice.last = now;
-        return;
-      }
-      const interval = 360 - v * 250;
-      if (now - voice.last! >= interval) {
-        voice.last = now;
-        const deg =
-          typeof note === "number" ? scaleDeg(scale, note) : scale[voice.phase! % scale.length] + 12 * (voice.phase! % 2);
-        voice.phase!++;
-        this._ping(mtof(60 + deg), 0.08 + v * 0.12, out, 0.9 + v * 1.2, 3.47); // inharmonic ratio
-      }
+    voice.trigger = (v, note, at) => {
+      const deg =
+        typeof note === "number" ? scaleDeg(scale, note) : scale[voice.phase! % scale.length] + 12 * (voice.phase! % 2);
+      voice.phase!++;
+      this._ping(mtof(60 + deg), 0.08 + v * 0.12, out, 0.9 + v * 1.2, 3.47, at);
     };
     return voice;
   }
@@ -1422,15 +1411,13 @@ export class AudioEngine {
     const out = this._out();
     out.gain.value = 1;
     const voice: Voice = { out, level: 0, last: 0, set: () => {} };
-    voice.set = (v) => {
-      if (this._due(voice, v, 25, 700)) this._tick(out, v);
-    };
+    voice.trigger = (v, _note, at) => this._tick(out, v, at);
     return voice;
   }
 
-  private _tick(dest: AudioNode, v: number): void {
+  private _tick(dest: AudioNode, v: number, at?: number): void {
     const ctx = this.ctx!;
-    const t = ctx.currentTime;
+    const t = at ?? ctx.currentTime;
     const src = ctx.createBufferSource();
     src.buffer = this._noiseBuffer(0.02);
     const hp = ctx.createBiquadFilter();
@@ -1467,10 +1454,19 @@ export class AudioEngine {
   }
 
   /** Tap-triggered pentatonic mallet. velocity: 0..127, pitchPos: 0..1. */
-  hit(velocity: number, pitchPos: number): void {
+  hit(velocity: number, pitchPos: number, timing?: InstrumentTiming, mainBpm = 120): void {
     if (!this.enabled || !this.ctx || !this.chimesOn) return;
     const ctx = this.ctx;
-    const t = ctx.currentTime;
+    let t = ctx.currentTime;
+    if (timing) {
+      const bpm = effectiveBpm(timing, mainBpm);
+      const period = stepSeconds(bpm, timing.division);
+      const origin = transport.origin + (timing.phaseOffset * 60) / bpm;
+      const steps = Math.max(0, Math.ceil((t - origin) / period - 1e-9));
+      t = Math.max(t, origin + steps * period);
+      if (Math.abs((this.oneShotGrid.chimes ?? -1) - t) < 0.0001) return;
+      this.oneShotGrid.chimes = t;
+    }
     const vel = Math.max(0.05, velocity / 127);
 
     const degree = Math.floor((pitchPos ?? 0) * this.scaleSpread);

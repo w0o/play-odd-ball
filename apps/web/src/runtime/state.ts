@@ -6,6 +6,13 @@
 import { signal } from "@preact/signals";
 import { OddballEngine, SEQ_GAP_DEFAULT, type Gesture } from "@oddball/core";
 import { AudioEngine, type InstrumentDef } from "../audio/engine";
+import {
+  DEFAULT_BPM,
+  DEFAULT_DIVISION,
+  clampBpm,
+  transport,
+  type InstrumentTiming,
+} from "../audio/transport";
 
 export const engine = new OddballEngine();
 export const audio = new AudioEngine();
@@ -15,6 +22,32 @@ export const INSTRUMENTS: InstrumentDef[] = [
   ...AudioEngine.INSTRUMENTS,
   { key: "chimes", label: "Chimes", noted: true },
 ];
+
+// ---- Transport / per-instrument tempo ------------------------------------
+export const mainBpmSig = signal(DEFAULT_BPM);
+export const transportBeatSig = signal(0);
+export const instrumentTiming: Record<string, InstrumentTiming> = {};
+INSTRUMENTS.forEach((inst) => {
+  instrumentTiming[inst.key] = {
+    mode: "main",
+    bpm: DEFAULT_BPM,
+    division: DEFAULT_DIVISION,
+    phaseOffset: 0,
+  };
+});
+
+export function setMainBpm(value: number): void {
+  const next = clampBpm(value);
+  const prev = mainBpmSig.peek();
+  if (next === prev) return;
+  transport.retime(prev, next);
+  mainBpmSig.value = next;
+}
+
+export function resyncTransport(): void {
+  transport.resync();
+  audio.resetTransportLanes();
+}
 
 // ---- Connections ---------------------------------------------------------
 // Each instrument input takes one parameter (or none). A connection carries a
@@ -73,6 +106,8 @@ export const seqQueue: { instKey: string; at: number }[] = []; // pending chain 
 export interface SeqCfg {
   mode: "together" | "sequence";
   gap: number;
+  /** Replacement-format spacing. Legacy bundles only contain gap (ms). */
+  stepDivision?: import("../audio/transport").BeatDivision;
 }
 export const seqCfg: Record<string, SeqCfg> = {}; // per plain-input playback config
 export const seqOnset: Record<string, { prev: number; last: number }> = {};
@@ -197,11 +232,14 @@ export interface Profile {
   id: string;
   name: string;
   created: number;
-  schema: number;
+  format: "oddball-transport";
+  version: 1;
   connections: Record<string, (Conn & { order?: number }) | null>;
-  seqCfg: Record<string, SeqCfg>;
+  sequences: Record<string, SeqCfg>;
   gestures: unknown[];
   sensitivity: number;
+  transport: { mainBpm: number };
+  instrumentTiming: Record<string, InstrumentTiming>;
 }
 export const profilesSig = signal<Profile[]>([]);
 

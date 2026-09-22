@@ -8,7 +8,9 @@ import {
   connEditorSig,
   editingGestureSig,
   gesturesSig,
+  instrumentTiming,
   logEvent,
+  mainBpmSig,
   profilesSig,
   sensitivitySig,
   seqCfg,
@@ -20,31 +22,65 @@ import {
   migrateBundleV2,
   PROFILE_KEY,
   saveState,
-  SCHEMA_VERSION,
+  STATE_FORMAT,
+  STATE_FORMAT_VERSION,
 } from "./persist";
+import { DEFAULT_BPM, DEFAULT_DIVISION, clampBpm, divisionFromMilliseconds, isDivision } from "../audio/transport";
 import { disconnect, resetSeqRuntime } from "./patch";
 import { INSTRUMENTS } from "./state";
 import { replaceGestures } from "./gestures";
 
 export function loadProfiles(): void {
-  let profiles: Profile[] = [];
+  let rawProfiles: any[] = [];
   try {
     const data = JSON.parse(localStorage.getItem(PROFILE_KEY) || "null");
-    profiles = Array.isArray(data) ? data.filter((p) => p && p.id) : [];
+    rawProfiles = Array.isArray(data) ? data.filter((p) => p && p.id) : [];
   } catch {
-    profiles = [];
+    rawProfiles = [];
   }
-  // Migrate pre-v2 profiles (old CC source names) and persist the upgrade once.
-  let changed = false;
-  for (const p of profiles) {
-    if (((p as any).schema || 1) < SCHEMA_VERSION) {
-      migrateBundleV2(p);
-      (p as any).schema = SCHEMA_VERSION;
-      changed = true;
+  profilesSig.value = rawProfiles.map(normalizeProfile);
+}
+
+function normalizeProfile(raw: any): Profile {
+  const modern = raw.format === STATE_FORMAT;
+  if (!modern && (raw.schema || 1) < 2) migrateBundleV2(raw);
+  const timings: Profile["instrumentTiming"] = {};
+  for (const inst of INSTRUMENTS) {
+    const value = modern ? raw.instrumentTiming?.[inst.key] : null;
+    timings[inst.key] = {
+      mode: value?.mode === "custom" ? "custom" : "main",
+      bpm: clampBpm(typeof value?.bpm === "number" ? value.bpm : DEFAULT_BPM),
+      division: isDivision(value?.division) ? value.division : DEFAULT_DIVISION,
+      phaseOffset: Number.isFinite(value?.phaseOffset) ? value.phaseOffset : 0,
+    };
+  }
+  const sourceSequences = modern ? raw.sequences : raw.seqCfg;
+  const sequences: Profile["sequences"] = {};
+  if (sourceSequences && typeof sourceSequences === "object") {
+    for (const source in sourceSequences) {
+      const value = sourceSequences[source];
+      if (!value || (value.mode !== "together" && value.mode !== "sequence")) continue;
+      const gap = typeof value.gap === "number" ? Math.max(0, value.gap) : 130;
+      sequences[source] = {
+        mode: value.mode,
+        gap,
+        stepDivision: isDivision(value.stepDivision) ? value.stepDivision : divisionFromMilliseconds(gap),
+      };
     }
   }
-  profilesSig.value = profiles;
-  if (changed) writeProfiles();
+  return {
+    id: String(raw.id),
+    name: typeof raw.name === "string" ? raw.name : "Profile",
+    created: typeof raw.created === "number" ? raw.created : Date.now(),
+    format: STATE_FORMAT,
+    version: STATE_FORMAT_VERSION,
+    connections: raw.connections && typeof raw.connections === "object" ? raw.connections : {},
+    sequences,
+    gestures: Array.isArray(raw.gestures) ? raw.gestures : [],
+    sensitivity: typeof raw.sensitivity === "number" ? raw.sensitivity : 45,
+    transport: { mainBpm: clampBpm(modern ? raw.transport?.mainBpm : DEFAULT_BPM) },
+    instrumentTiming: timings,
+  };
 }
 
 export function writeProfiles(): void {
@@ -68,11 +104,14 @@ export function saveCurrentProfile(): string {
     id: "p" + Date.now().toString(36),
     name: `Profile ${profiles.length + 1}`,
     created: Date.now(),
-    schema: SCHEMA_VERSION,
+    format: STATE_FORMAT,
+    version: STATE_FORMAT_VERSION,
     connections: serializeConnections(),
-    seqCfg: JSON.parse(JSON.stringify(seqCfg)),
+    sequences: JSON.parse(JSON.stringify(seqCfg)),
     gestures: serializeGestures(gesturesSig.peek()),
     sensitivity: sensitivitySig.peek(),
+    transport: { mainBpm: mainBpmSig.peek() },
+    instrumentTiming: JSON.parse(JSON.stringify(instrumentTiming)),
   };
   profilesSig.value = [...profiles, p];
   writeProfiles();
@@ -101,7 +140,11 @@ export function applyProfile(id: string): void {
   replaceGestures(profile.gestures as unknown[]);
 
   // Restore per-source playback config (together vs. in order).
-  applySeqCfg(profile.seqCfg, true);
+  applySeqCfg(profile.sequences, true);
+  mainBpmSig.value = profile.transport.mainBpm;
+  for (const key in instrumentTiming) {
+    instrumentTiming[key] = { ...profile.instrumentTiming[key] };
+  }
 
   // Now that every source exists, apply the saved connections.
   audio.chimesOn = false;

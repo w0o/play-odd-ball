@@ -66,6 +66,27 @@ body {
 
 .controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }
 
+.tempo {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 6px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--panel-2); color: var(--muted); font-size: 10px; font-weight: 700;
+}
+.tempo button {
+  width: 25px; height: 25px; padding: 0; border: 0; border-radius: 6px;
+  background: transparent; color: var(--text); cursor: pointer; font-size: 15px;
+}
+.tempo button:hover { background: #2a2e4e; }
+.tempo input {
+  width: 48px; padding: 3px 2px; border: 0; outline: 0; background: transparent;
+  color: var(--text); font: 700 13px/1 ui-monospace, monospace; text-align: right;
+  cursor: ns-resize; touch-action: none; user-select: text;
+}
+.tempo input:focus { background: rgba(255, 255, 255, 0.06); border-radius: 4px; }
+.tempo input::-webkit-inner-spin-button { display: none; }
+.tempo-pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--accent-2); opacity: 0.35; }
+.tempo-pulse--0 { opacity: 1; box-shadow: 0 0 8px var(--accent-2); }
+.tempo .tempo-sync { color: var(--accent-2); }
+
 .views { display: inline-flex; gap: 6px; padding: 3px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px; }
 .view-btn {
   font-size: 12px; font-weight: 600; color: var(--muted);
@@ -709,6 +730,11 @@ body {
 .ce-seq-btn:hover:not(:disabled) { border-color: var(--accent-2); color: var(--accent-2); }
 .ce-seq-btn:disabled { opacity: 0.4; cursor: default; }
 .ce-seq .ce-row { margin-bottom: 0; }
+.ce-rhythm { margin-bottom: 12px; }
+.ce-tempo-row input[type="number"] {
+  width: 100%; padding: 7px 9px; border-radius: 8px; border: 1px solid var(--line);
+  background: #111426; color: var(--text); font: 700 13px/1 ui-monospace, monospace;
+}
 
 .ce-disconnect {
   width: 100%; font-size: 12px; font-weight: 600; cursor: pointer;

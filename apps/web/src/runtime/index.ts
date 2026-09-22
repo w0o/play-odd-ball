@@ -1,6 +1,6 @@
 // App bootstrap: restore persisted state, wire events, start the loops.
 import { audio, connections, engine, histOpenSig, patchViewSig, viewsSig } from "./state";
-import { applySavedState, doneLoading, loadState, saveState } from "./persist";
+import { applySavedState, doneLoading, loadState } from "./persist";
 import { loadGestures, wireRecognizerEvents } from "./gestures";
 import { loadProfiles } from "./profiles";
 import { initMidi, onMidiMessage } from "./midi";
@@ -27,9 +27,9 @@ export async function initRuntime(): Promise<void> {
 
   setSoundIntentFromSaved(saved && typeof saved.sound === "boolean" ? saved.sound : true);
 
-  // Everything restored — allow saves and persist the current state once.
+  // Everything restored — allow future user-driven saves. Do not rewrite a
+  // legacy bundle merely by opening the app; its next ordinary save upgrades it.
   doneLoading();
-  saveState();
 
   startLoop();
 
